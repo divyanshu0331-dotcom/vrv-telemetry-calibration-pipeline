@@ -1,0 +1,105 @@
+import numpy as np
+import pandas as pd
+from scipy.optimize import curve_fit
+import matplotlib.pyplot as plt
+
+
+# Extracting a representative subset from the provided Daikin specification sheet
+# Temp (°C), Lower Limit (kΩ), Mean (kΩ), Upper Limit (kΩ)
+daikin_spec_data = {
+    'temp_c': [-30, -20, -10, 0, 10, 20, 25, 30, 40, 50, 60, 70, 80],
+    'lower_limit_kohm': [330.20, 182.50, 104.80, 62.28, 38.22, 24.15, 19.40, 15.54, 10.17, 6.819, 4.674, 3.268, 2.329],
+    'mean_kohm':        [360.80, 197.00, 111.80, 65.75, 39.96, 25.01, 20.00, 16.10, 10.62, 7.176, 4.955, 3.489, 2.503],
+    'upper_limit_kohm': [393.80, 212.50, 119.30, 69.36, 41.74, 25.89, 20.60, 16.66, 11.09, 7.545, 5.249, 3.722, 2.688]
+}
+
+df_spec = pd.DataFrame(daikin_spec_data)
+# Convert kΩ to standard Ohms for baseline physical equations
+df_spec['mean_ohm'] = df_spec['mean_kohm'] * 1000
+df_spec['temp_k'] = df_spec['temp_c'] + 273.15
+
+
+def steinhart_hart_model(R, A, B, C):
+    """Mathematical definition: 1/T = A + B*ln(R) + C*(ln(R))^3"""
+    lnR = np.log(R)
+    return 1.0 / (A + B * lnR + C * (lnR**3))
+
+# Execute least-squares curve fit against Daikin Mean Spec points
+popt, _ = curve_fit(
+    f=steinhart_hart_model, 
+    xdata=df_spec['mean_ohm'], 
+    ydata=df_spec['temp_k'], 
+    p0=[1e-3, 1e-4, 1e-7]
+)
+A_calibrated, B_calibrated, C_calibrated = popt
+
+print("="*60)
+print("DAIKIN NTC THERMISTOR CALIBRATION COEFFICIENTS (DERIVED)")
+print(f"A = {A_calibrated:.7e}")
+print(f"B = {B_calibrated:.7e}")
+print(f"C = {C_calibrated:.7e}")
+print("="*60)
+
+
+test_temps = np.arange(-30, 81, 1)
+lower_bounds_kohm = np.interp(test_temps, df_spec['temp_c'], df_spec['lower_limit_kohm'])
+upper_bounds_kohm = np.interp(test_temps, df_spec['temp_c'], df_spec['upper_limit_kohm'])
+
+def evaluate_anomaly(temp_c, resistance_kohm):
+    """Flags anomalies based on physical spec boundaries & hardware safety cuts."""
+    # Find matching index for bounding thresholds
+    idx = np.abs(test_temps - temp_c).argmin()
+    r_lower = lower_bounds_kohm[idx]
+    r_upper = upper_bounds_kohm[idx]
+    
+    # Flag thresholds
+    if resistance_kohm <= 0.1:  # Physical dead short 
+        return "CRITICAL: Short Circuit Intercepted"
+    elif resistance_kohm >= 1000.0:  # Broken wire / disconnected plug
+        return "CRITICAL: Open Circuit / Disconnected"
+    elif resistance_kohm < r_lower:
+        return "ANOMALY: Negative Drift / Sub-spec Variance"
+    elif resistance_kohm > r_upper:
+        return "ANOMALY: Positive Drift / Component Degradation"
+    else:
+        return "Normal"
+
+
+# Create 10 time intervals simulating changing VRV operational load profiles
+np.random.seed(12)
+sim_timestamps = [f"2026-10-07 09:{i:02d}:00" for i in range(10)]
+
+# Mock telemetry input streams (mix of normal and abnormal test nodes)
+live_resistance_stream_kohm = [
+    65.75,  # 0°C Normal
+    39.96,  # 10°C Normal
+    20.00,  # 25°C Normal
+    18.20,  # 25°C Unnatural negative shift (Drift anomaly)
+    10.62,  # 40°C Normal
+    2.503,  # 80°C Normal
+    3.100,  # 80°C Unnatural positive shift (Drift anomaly)
+    0.02,   # Hard system failure short circuit
+    2.503,  # 80°C Normal
+    1500.0  # Hard system physical open circuit
+]
+
+# Process telemetry frames
+telemetry_results = []
+for ts, r_kohm in zip(sim_timestamps, live_resistance_stream_kohm):
+    r_ohm = r_kohm * 1000
+    # Apply fitted calibration parameters to resolve raw metric back to Celsius
+    calc_temp_k = steinhart_hart_model(r_ohm, A_calibrated, B_calibrated, C_calibrated)
+    calc_temp_c = calc_temp_k - 273.15
+    
+    status = evaluate_anomaly(calc_temp_c, r_kohm)
+    
+    telemetry_results.append({
+        "Timestamp": ts,
+        "Raw_kΩ": r_kohm,
+        "Calibrated_Temp_°C": round(calc_temp_c, 2),
+        "Status": status
+    })
+
+df_output = pd.DataFrame(telemetry_results)
+print("\n" + "LIVE VRV SYSTEM TELEMETRY OUTPUT STREAM REPORT")
+print(df_output.to_string(index=False))
